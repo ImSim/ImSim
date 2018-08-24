@@ -1,0 +1,297 @@
+##!/usr/bin/env python3
+
+'''
+Classifies contrast type (T1, T2, etc from an input neuro DICOM MRI exam). 
+'''
+
+import json
+import argparse
+import datetime
+import pydicom
+import collections
+import os
+import shutil
+import pprint
+
+##########################
+import sys
+from os.path import dirname, basename, abspath, join
+this_script = basename(__file__)
+is_dev = ""
+if this_script.endswith('.dev'):
+    is_dev = ".dev" 
+THIS_DIR = dirname(__file__)
+MODULE_DIR = abspath(join(THIS_DIR, 'contrast_classifier_modules' + is_dev ))
+sys.path.append(MODULE_DIR)
+##########################
+
+from frfse_separate import FRFSEFilter
+import feature_utils as fu
+from models import ClassificationModel
+import mri_utils as mu
+import directory_utils as du
+
+CURRENT_VERSION = "v0.0.1"
+
+
+def add_dicom_info_to_dictionary(results_dictionary, dicom_file, contrast, anatomy):
+    '''
+    DESCRIPTION
+    -----------
+    The purpose of this function is to add DICOM file, contrast, and anatomy information
+    in the right places in the dictionary. We use the pydicom package to get various
+    pieces of information and then load that into the dictionary
+
+    INPUTS
+    ------
+    results_dictionary (dictionary): the dictionary you'd like to input
+    dicom_file (string): this is the name of the file that is associated with the
+                         contrast and anatomy you're inputting
+    contrast (string): classification of contrast type by SVM
+    anatomy (string): anatomy of the dicom you're looking at (body part)
+
+    OUTPUTS
+    -------
+    None (written to dictionary, which is mutable)
+
+    NOTE:  because FRFSE and potentially other series are serparated into separate 
+    dirs logically (symlinks) without rewriting the original, and thus the seriesInstanceUIDs
+    and seriesNumbers in the new separated dirs aren't modified, the following series level is 
+    organized by series path, rather than seriesInstanceUID.
+    modified
+    '''
+
+    dcm_obj     = pydicom.dcmread(dicom_file)
+    study_uid   = dcm_obj.StudyInstanceUID
+    series_path = dirname(dicom_file)
+    series_uid  = dcm_obj.SeriesInstanceUID
+
+    if "Exams" not in results_dictionary:
+        results_dictionary["Exams"] = {}
+    if study_uid not in results_dictionary["Exams"]:
+        results_dictionary["Exams"][study_uid] = {}
+    if "Series" not in results_dictionary["Exams"][study_uid]:
+        results_dictionary["Exams"][study_uid]["Series"] = {}
+    if series_path not in results_dictionary["Exams"][study_uid]["Series"]:
+        results_dictionary["Exams"][study_uid]["Series"][series_path] = {}
+        results_dictionary["Exams"][study_uid]["Series"][series_path]["SeriesUID"] = []
+        results_dictionary["Exams"][study_uid]["Series"][series_path]["Contrast"] = []
+        results_dictionary["Exams"][study_uid]["Series"][series_path]["Anatomy"] = []
+
+    results_dictionary["Exams"][study_uid]["Series"][series_path]["SeriesUID"].append(series_uid)
+    results_dictionary["Exams"][study_uid]["Series"][series_path]["Contrast"].append(contrast)
+    results_dictionary["Exams"][study_uid]["Series"][series_path]["Anatomy"].append(anatomy)
+
+
+def post_process_results_dictionary(results_dictionary):
+    '''
+    This goes through every single DICOM file in the dictionary and if more than once classification 
+    per series, picks the most common classification.
+    It will most probably not be used in the final classification.
+    '''
+    for study_uid in results_dictionary["Exams"]:
+        for series_uid in results_dictionary["Exams"][study_uid]["Series"]:
+            contrast_list = results_dictionary["Exams"][study_uid]["Series"][series_uid]["Contrast"]
+            anatomy_list = results_dictionary["Exams"][study_uid]["Series"][series_uid]["Anatomy"]
+            results_dictionary["Exams"][study_uid]["Series"][series_uid]["Contrast"] = max(set(contrast_list), key=contrast_list.count)
+            results_dictionary["Exams"][study_uid]["Series"][series_uid]["Anatomy"] = max(set(anatomy_list), key=anatomy_list.count)
+
+def save_dictionary_as_json_file(dictionary, json_filename):
+    '''
+    This function is pretty simple. It takes a traditional python
+    dictionary and saves it as a json file in the json_filename.
+    '''
+    with open(json_filename, 'w') as fp:
+        json.dump(dictionary, fp)
+
+def get_contrast_and_anatomy_list_from_model_run(model_classifications):
+    '''
+    This function doesn't do too much yet. Right now, it takes in the model_classifications,
+    which is an array of numbers, and figures out the actual classes of said function
+    outputs.
+    INPUT: list of lists, first of which  is the contrst class, the second is that anatomy class
+    '''
+    contrast_index = 0
+    anatomy_index  = 1
+    contrast_list = [mu.CONTRAST_CLASSES[index] for index in model_classifications[contrast_index]]
+    anatomy_list  = [mu.ANATOMY_CLASSES[index]  for index in model_classifications[anatomy_index]]
+    return contrast_list, anatomy_list
+
+
+def preprocess_input(exam_dir, output_path, no_exam_preprocessing):
+    '''
+    DESCRIPTION
+    -----------
+    Takes care of any initial data organization bookeeping.  
+        - creates temp exam directory (symlinks to original exam)
+        - separates out dual echo  frfse series into seprate e series for classification 
+
+    INPUT: path to folder containing DICOM exam
+            no_exam_preprocessing (True/False) - if True, just link input to output, but do  not  
+            frfse separate
+    OUTPUT: path to temp folder containing symlinked version of exam      
+    '''
+     
+    #   create linked version of exam in the output_directory 
+    tmp_exam_dir =  output_path + "/contrast_classifier_out"
+
+    #   clean the tmp directory if it already exists: 
+    if os.path.exists(tmp_exam_dir):
+        try:
+            shutil.rmtree(tmp_exam_dir)
+        except OSError as exc:
+            print ("Error: %s - %s." % (exc.filename, exc.strerror))
+
+ 
+    if not os.path.exists(tmp_exam_dir):
+        try:
+            os.makedirs(tmp_exam_dir)
+        except OSError as exc: # Guard against race condition
+            if exc.errno != errno.EEXIST:
+                raise
+    
+    du.deep_symlink_examdir(exam_dir, tmp_exam_dir)
+
+    if (no_exam_preprocessing == False):
+        #   separate out echo times from any detectable FRFSE series
+        verbose = False 
+        ff = FRFSEFilter(tmp_exam_dir, verbose)
+        ff.separate_series()
+    
+
+    return tmp_exam_dir 
+
+
+def contrast_classifier(args, cmd_string):
+    '''
+    DESCRIPTION
+    -----------
+    This car basically takes command line arguments and eventually
+    writes a dictioary to file in the form of a JSON file. We want to get
+    the Date, ClassificationModel, Version, Arguments. For every single DICOM, we put the
+    contrast and anatomy into the dictionary.
+    '''
+
+    input_path    = args.input_path
+    output_path   = args.output_path
+    json_filename = args.json_filename
+    model_type    = args.model_type
+    verbose       = args.verbose 
+
+    #===========================================================================
+    #   Create a tmp exam to  work with  and apply and additional preprocessing
+    #===========================================================================
+    input_path = preprocess_input(input_path, output_path, args.no_exam_preprocessing)
+
+    #===========================================================================
+    #   Get the list of series from the preprocessed exam in  the  new tmp folder
+    #===========================================================================
+    series_dirs = mu.get_series_dirs( input_path, verbose )
+    if  ( verbose == True ): 
+        print( "SERIES: ", series_dirs )
+
+    #===========================================================================
+    #   Get a list of the first DICOM image in each of the above series: 
+    #===========================================================================
+    first_dcms = [mu.get_first_dcm_image_in_dir(series_dir, verbose) for series_dir in series_dirs]
+
+    if  ( verbose == True ): 
+        print( "SERIES: ", first_dcms)
+
+    #===========================================================================
+    # load the model
+    #===========================================================================
+    #   default model
+    if not model_type:
+        model_type = "svm_meta"
+
+    results = collections.OrderedDict()
+    results['Date'] = str(datetime.date.today())
+    results['Model'] = model_type
+    results['Version'] = CURRENT_VERSION
+    results["Arguments"] = str(args)
+
+    if  ( verbose == True ): 
+        print( "Classify: ")
+    model = ClassificationModel.factory(model_type, args.models_dir)
+    model.set_output_dir(input_path)
+    if  ( verbose == True ): 
+        print( "    add inputs: ")
+    model.add_inputs(first_dcms)
+    if  ( verbose == True ): 
+        print( "    run model: ")
+    model_classifications = model.run()
+    #print("MC: ", model_classifications)
+    if  ( verbose == True ): 
+        print( "    write json: ")
+    contrast_list, anatomy_list = get_contrast_and_anatomy_list_from_model_run(model_classifications)
+    n = len(first_dcms)
+
+    #===========================================================================
+    #   print results to stdout and create dictionary of results for each series
+    #===========================================================================
+    print("")
+    output = ""
+    print("============================================")
+    print("Output Dir:  " +  input_path) 
+    output += "============================================\n"
+    output += "{:<25s} {:<100s} \n".format( "cmd:", cmd_string )
+    model_info  = model.get_model_info()
+    for key in model_info:
+        key_string   = key + ":"
+        value        = "\n                     ".join(str(model_info[key]).split("\n"))
+        output += "{:<25s} {:<100s} \n".format(key_string, value)
+    output += "============================================\n"
+    for i in range(n):
+        dicom_file  = first_dcms[i]
+        contrast    = contrast_list[i]
+        anatomy     = anatomy_list[i]
+        add_dicom_info_to_dictionary(results, dicom_file, contrast, anatomy)
+        output += "{:<130s} {:<8s} {:<5s} \n".format(dirname(dicom_file), contrast, anatomy)
+    output += "============================================\n"
+
+    print(output)
+    print("")
+
+    with open(input_path + "/classification.out", "w") as out_file:
+        out_file.write(output)
+
+    #===========================================================================
+    #   write out dictionary of series classifications
+    #===========================================================================
+    post_process_results_dictionary(results)
+    save_dictionary_as_json_file(results, input_path + "/" + json_filename)
+
+
+
+if __name__ == '__main__':
+    '''  
+        Example:  ./contrast_classifier -i /data/svcf/test_cases/mse1927 -j ./mse1927_svm_meta.json
+    '''
+
+    print("")
+    PARSER = argparse.ArgumentParser(description="MRI Contrast Classifier. Models are in beta testing and will be provided in the fall of 2018.")
+
+    PARSER.add_argument("-i", "--input_path", required=True,
+                        help="Path to the directory of singula 'DICOM' exam or an individual '.dcm' file")
+    PARSER.add_argument("--no_exam_preprocessing", action='store_true', default=False, required=False,
+                        help="If specified, use the input exam dirs as is, do not relink or separate frfse series, assume already done" )
+    PARSER.add_argument("-o", "--output_path", required=False, default="./", 
+                        help="Path where output data is written including temp files.")
+    PARSER.add_argument("-j", "--json_filename", required=False, default='classification.json', 
+                        help="Name of output JSON file with classifications. Should be '.json' type.")
+    PARSER.add_argument("-m", "--model_type", required=False,
+                        help="Type of model, in ['heuristic', 'cnn', 'svm_meta', 'svm_meta_or, 'svm_meta_or_pix'].")
+    PARSER.add_argument("--models_dir", required=False,
+                        help="Custom dir to find trained models, overrides location in imsim_classifier_config.py")
+    PARSER.add_argument("-v", "--verbose",  help = "verbose output", action='store_true', default=False,   required=False)
+
+    ARGS = PARSER.parse_args()
+
+    cmd_string = ' '.join(sys.argv)
+    with open("Logfile", "a") as logfile:
+        logfile.write( cmd_string )
+        logfile.write( '\n' )
+
+    contrast_classifier(ARGS, cmd_string)
+
